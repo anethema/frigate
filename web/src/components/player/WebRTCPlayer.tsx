@@ -1,5 +1,9 @@
 import { baseUrl } from "@/api/baseUrl";
-import { LivePlayerError, PlayerStatsType } from "@/types/live";
+import {
+  LivePlayerError,
+  PlayerStatsType,
+  VideoResolutionType,
+} from "@/types/live";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type WebRtcPlayerProps = {
@@ -14,6 +18,7 @@ type WebRtcPlayerProps = {
   getStats?: boolean;
   setStats?: (stats: PlayerStatsType) => void;
   onPlaying?: () => void;
+  setFullResolution?: (resolution: VideoResolutionType) => void;
   onError?: (error: LivePlayerError) => void;
 };
 
@@ -29,6 +34,7 @@ export default function WebRtcPlayer({
   getStats = false,
   setStats,
   onPlaying,
+  setFullResolution,
   onError,
 }: WebRtcPlayerProps) {
   // metadata
@@ -239,6 +245,12 @@ export default function WebRtcPlayer({
   const handleLoadedData = () => {
     if (videoLoadTimeoutRef.current) {
       clearTimeout(videoLoadTimeoutRef.current);
+    }
+    if (videoRef.current) {
+      setFullResolution?.({
+        width: videoRef.current.videoWidth,
+        height: videoRef.current.videoHeight,
+      });
     }
     onPlaying?.();
   };

@@ -274,6 +274,10 @@ export default function LiveCameraView({
   );
 
   const [showStats, setShowStats] = useState(false);
+  const [showObjectOverlay, setShowObjectOverlay] = useUserPersistence<boolean>(
+    `${camera.name}-live-object-boxes`,
+    true,
+  );
   const [debug, setDebug] = useState(false);
 
   useSearchEffect("debug", (value: string) => {
@@ -609,6 +613,8 @@ export default function LiveCameraView({
               setPlayInBackground={setPlayInBackground}
               showStats={showStats}
               setShowStats={setShowStats}
+              showObjectOverlay={showObjectOverlay ?? true}
+              setShowObjectOverlay={setShowObjectOverlay}
               isRestreamed={isRestreamed ?? false}
               setLowBandwidth={setLowBandwidth}
               supportsAudioOutput={supportsAudioOutput}
@@ -651,6 +657,8 @@ export default function LiveCameraView({
                   playAudio={audio}
                   playInBackground={playInBackground ?? false}
                   showStats={showStats}
+                  showObjectOverlay={showObjectOverlay ?? true}
+                  objectColormap={config?.model?.colormap}
                   micEnabled={mic}
                   iOSCompatFullScreen={isIOS}
                   preferredLiveMode={preferredLiveMode}
@@ -719,6 +727,8 @@ type FrigateCameraFeaturesProps = {
   setPlayInBackground: (value: boolean | undefined) => void;
   showStats: boolean;
   setShowStats: (value: boolean) => void;
+  showObjectOverlay: boolean;
+  setShowObjectOverlay: (value: boolean | undefined) => void;
   isRestreamed: boolean;
   setLowBandwidth: React.Dispatch<React.SetStateAction<boolean>>;
   supportsAudioOutput: boolean;
@@ -741,6 +751,8 @@ function FrigateCameraFeatures({
   setPlayInBackground,
   showStats,
   setShowStats,
+  showObjectOverlay,
+  setShowObjectOverlay,
   isRestreamed,
   setLowBandwidth,
   supportsAudioOutput,
@@ -1299,6 +1311,30 @@ function FrigateCameraFeatures({
                     </p>
                   </div>
                 )}
+                {isRestreamed && (
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between">
+                      <Label
+                        className="mx-0 cursor-pointer text-primary"
+                        htmlFor="show-object-overlay"
+                      >
+                        {t("stream.objectOverlay.label")}
+                      </Label>
+                      <Switch
+                        className="ml-1"
+                        id="show-object-overlay"
+                        disabled={debug}
+                        checked={showObjectOverlay}
+                        onCheckedChange={(checked) =>
+                          setShowObjectOverlay(checked)
+                        }
+                      />
+                    </div>
+                    <p className="text-sm text-muted-foreground">
+                      {t("stream.objectOverlay.tips")}
+                    </p>
+                  </div>
+                )}
                 <div className="flex flex-col gap-1">
                   <div className="flex items-center justify-between">
                     <Label
@@ -1689,6 +1725,19 @@ function FrigateCameraFeatures({
                     />
                     <p className="mx-2 -mt-2 text-sm text-muted-foreground">
                       {t("manualRecording.showStats.desc")}
+                    </p>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <FilterSwitch
+                      label={t("stream.objectOverlay.label")}
+                      isChecked={showObjectOverlay}
+                      onCheckedChange={(checked) => {
+                        setShowObjectOverlay(checked);
+                      }}
+                      disabled={debug}
+                    />
+                    <p className="mx-2 -mt-2 text-sm text-muted-foreground">
+                      {t("stream.objectOverlay.tips")}
                     </p>
                   </div>
                 </>

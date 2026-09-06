@@ -27,6 +27,8 @@ import { useCameraFriendlyName } from "@/hooks/use-camera-friendly-name";
 import { ImageShadowOverlay } from "../overlay/ImageShadowOverlay";
 import { getTranslatedLabel } from "@/utils/i18n";
 import { formatList } from "@/utils/stringUtil";
+import { useLiveObjectOverlay } from "@/hooks/use-live-object-overlay";
+import LiveObjectOverlay from "@/components/overlay/LiveObjectOverlay";
 
 type LivePlayerProps = {
   cameraRef?: (ref: HTMLDivElement | null) => void;
@@ -47,6 +49,8 @@ type LivePlayerProps = {
   pip?: boolean;
   autoLive?: boolean;
   showStats?: boolean;
+  showObjectOverlay?: boolean;
+  objectColormap?: Record<string, [number, number, number]>;
   onClick?: () => void;
   setFullResolution?: React.Dispatch<React.SetStateAction<VideoResolutionType>>;
   onError?: (error: LivePlayerError) => void;
@@ -72,6 +76,8 @@ export default function LivePlayer({
   pip,
   autoLive = true,
   showStats = false,
+  showObjectOverlay = false,
+  objectColormap,
   onClick,
   setFullResolution,
   onError,
@@ -114,6 +120,31 @@ export default function LivePlayer({
   // camera live state
 
   const [liveReady, setLiveReady] = useState(false);
+  const [streamResolution, setStreamResolution] = useState<VideoResolutionType>(
+    { width: 0, height: 0 },
+  );
+
+  const handleFullResolution = useCallback<
+    React.Dispatch<React.SetStateAction<VideoResolutionType>>
+  >(
+    (resolution) => {
+      setStreamResolution(resolution);
+      setFullResolution?.(resolution);
+    },
+    [setFullResolution],
+  );
+
+  const liveObjectOverlay = useLiveObjectOverlay({
+    camera: cameraConfig.name,
+    enabled:
+      showObjectOverlay &&
+      Boolean(cameraEnabled) &&
+      !offline &&
+      windowVisible &&
+      !pip,
+    liveReady,
+    liveMode: preferredLiveMode,
+  });
 
   const liveReadyRef = useRef(liveReady);
   const cameraActiveRef = useRef(cameraActive);
@@ -187,6 +218,7 @@ export default function LivePlayer({
 
   const resetPlayer = () => {
     setLiveReady(false);
+    setStreamResolution({ width: 0, height: 0 });
     setKey((prevKey) => prevKey + 1);
   };
 
@@ -255,6 +287,7 @@ export default function LivePlayer({
         microphoneEnabled={micEnabled}
         iOSCompatFullScreen={iOSCompatFullScreen}
         onPlaying={playerIsPlaying}
+        setFullResolution={handleFullResolution}
         pip={pip}
         onError={onError}
       />
@@ -274,7 +307,7 @@ export default function LivePlayer({
           setStats={setStats}
           onPlaying={playerIsPlaying}
           pip={pip}
-          setFullResolution={setFullResolution}
+          setFullResolution={handleFullResolution}
           onError={onError}
         />
       );
@@ -338,6 +371,14 @@ export default function LivePlayer({
           />
         )}
       {player}
+      {showObjectOverlay && !pip && (
+        <LiveObjectOverlay
+          overlay={liveObjectOverlay}
+          expectedWidth={streamResolution.width}
+          expectedHeight={streamResolution.height}
+          colormap={objectColormap}
+        />
+      )}
       {cameraEnabled &&
         !offline &&
         (!showStillWithoutActivity || isReEnabling) &&

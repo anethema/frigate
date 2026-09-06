@@ -145,6 +145,10 @@
     "playInBackground": {
       "label": "Play in background",
       "tips": "Enable this option to continue streaming when the player is hidden."
+    },
+    "objectOverlay": {
+      "label": "Show object boxes",
+      "tips": "Show live detected objects over supported streams."
     }
   },
   "cameraSettings": {

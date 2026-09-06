@@ -33,6 +33,27 @@ export type LiveStreamMetadata = {
 
 export type LivePlayerError = "stalled" | "startup" | "mse-decode";
 
+export type LiveObject = {
+  id: string;
+  frame_time: number;
+  label: string;
+  sub_label: string | null;
+  score: number;
+  stationary: boolean;
+  box: [number, number, number, number];
+  autotracked: boolean;
+};
+
+export type LiveObjectOverlay = {
+  schema_version: 1;
+  camera: string;
+  frame_time: number;
+  detect_width: number;
+  detect_height: number;
+  autotracked_object_id: string | null;
+  objects: LiveObject[];
+};
+
 export type AudioState = Record<string, boolean>;
 export type StatsState = Record<string, boolean>;
 export type VolumeState = Record<string, number>;
