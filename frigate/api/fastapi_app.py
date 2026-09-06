@@ -19,6 +19,7 @@ from frigate.api import (
     classification,
     event,
     export,
+    live_objects,
     media,
     notification,
     preview,
@@ -120,6 +121,7 @@ def create_fastapi_app(
     # Order of include_router matters: https://fastapi.tiangolo.com/tutorial/path-params/#order-matters
     app.include_router(auth.router)
     app.include_router(camera.router)
+    app.include_router(live_objects.router)
     app.include_router(classification.router)
     app.include_router(review.router)
     app.include_router(main_app.router)

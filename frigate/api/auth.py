@@ -97,6 +97,7 @@ def require_admin_by_default():
         "/exports/",  # /exports/{export_id}
         "/vod/",  # /vod/{camera_name}/...
         "/notifications/",  # /notifications/pubkey, /notifications/register
+        "/live/",  # /live/{camera_name}/objects (camera-scoped)
     )
 
     async def admin_checker(request: Request):
