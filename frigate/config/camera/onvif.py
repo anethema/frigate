@@ -1,7 +1,8 @@
+import math
 from enum import Enum
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from ..base import FrigateBaseModel
 from ..env import EnvString
@@ -18,11 +19,31 @@ class ZoomingModeEnum(str, Enum):
 
 class PtzAutotrackConfig(FrigateBaseModel):
     enabled: bool = Field(default=False, title="Enable PTZ object autotracking.")
+    movement_status: Literal["onvif", "position"] = Field(
+        default="onvif",
+        title="Movement status source. Position is an experimental PTZ fallback.",
+    )
+    preset_movement: Literal["preset", "absolute"] = Field(
+        default="preset",
+        title="Use saved preset coordinates when native preset recall is broken.",
+    )
+    return_preset_position: Optional[list[float]] = Field(
+        default=None,
+        min_length=3,
+        max_length=3,
+        title="Verified native return-preset pan, tilt, zoom when preset metadata is incorrect.",
+    )
     calibrate_on_startup: bool = Field(
         default=False, title="Perform a camera calibration when Frigate starts."
     )
     zooming: ZoomingModeEnum = Field(
         default=ZoomingModeEnum.disabled, title="Autotracker zooming mode."
+    )
+    position_zoom_limits: Optional[list[float]] = Field(
+        default=None,
+        min_length=2,
+        max_length=2,
+        title="Verified reachable zoom limits in normalized ONVIF coordinates for position status.",
     )
     zoom_factor: float = Field(
         default=0.3,
@@ -49,6 +70,24 @@ class PtzAutotrackConfig(FrigateBaseModel):
     enabled_in_config: Optional[bool] = Field(
         default=None, title="Keep track of original state of autotracking."
     )
+
+    @model_validator(mode="after")
+    def validate_position_status(self):
+        if self.movement_status == "position" and self.zooming == ZoomingModeEnum.relative:
+            raise ValueError("Position movement status supports zooming: disabled or absolute")
+        if self.position_zoom_limits is not None:
+            low, high = self.position_zoom_limits
+            if self.movement_status != "position" or not all(math.isfinite(x) for x in (low, high)) or not 0 <= low < high <= 1:
+                raise ValueError("Position zoom limits require position status and 0 <= min < max <= 1")
+        if self.preset_movement == "absolute" and self.movement_status != "position":
+            raise ValueError("Absolute preset recall requires position movement status")
+        if self.return_preset_position is not None:
+            pan, tilt, zoom = self.return_preset_position
+            if self.movement_status != "position" or not all(math.isfinite(x) for x in (pan, tilt, zoom)):
+                raise ValueError("Verified preset position requires position status and finite coordinates")
+            if not (-1 <= pan <= 1 and -1 <= tilt <= 1 and 0 <= zoom <= 1):
+                raise ValueError("Verified preset position must use normalized generic coordinates")
+        return self
 
     @field_validator("movement_weights", mode="before")
     @classmethod

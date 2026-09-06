@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import threading
 import time
 from enum import Enum
@@ -15,6 +16,7 @@ from zeep.exceptions import Fault, TransportError
 
 from frigate.camera import PTZMetrics
 from frigate.config import FrigateConfig, ZoomingModeEnum
+from frigate.ptz.position_status import IDLE, PositionStatus, PositionStatusError
 from frigate.util.builtin import find_by_key
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,11 @@ class OnvifController:
         self.ptz_metrics = ptz_metrics
 
         self.status_locks: dict[str, asyncio.Lock] = {}
+        self.position_move_locks: dict[str, asyncio.Lock] = {}
+        self.position_states: dict[str, PositionStatus] = {}
+        self.position_faults: dict[str, str] = {}
+        self.position_poll_interval = 0.05
+        self.position_rpc_timeout = 3.0
 
         # Create a dedicated event loop and run it in a separate thread
         self.loop = asyncio.new_event_loop()
@@ -64,8 +71,183 @@ class OnvifController:
             if cam.onvif.host:
                 self.camera_configs[cam_name] = cam
                 self.status_locks[cam_name] = asyncio.Lock()
+                self.position_move_locks[cam_name] = asyncio.Lock()
 
         asyncio.run_coroutine_threadsafe(self._init_cameras(), self.loop)
+
+    def _uses_position_status(self, camera_name: str) -> bool:
+        return (
+            self.config.cameras[camera_name].onvif.autotracking.movement_status
+            == "position"
+        )
+
+    @staticmethod
+    def _position_tuple(position, *, require_zoom=False) -> tuple[float, float, float]:
+        try:
+            pan = float(position.PanTilt.x)
+            tilt = float(position.PanTilt.y)
+            zoom_position = getattr(position, "Zoom", None)
+            if require_zoom and zoom_position is None:
+                raise PositionStatusError("Absolute autotracking requires a numeric zoom position")
+            zoom = float(zoom_position.x) if zoom_position is not None else 0.0
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise PositionStatusError("PTZ status has no usable numeric position") from exc
+        if not all(math.isfinite(v) for v in (pan, tilt, zoom)):
+            raise PositionStatusError("PTZ status contains a non-finite position")
+        return pan, tilt, zoom
+
+    @staticmethod
+    def _positions_match(left, right, tolerance=0.0001, zoom_tolerance=None) -> bool:
+        pan_distance = abs((left[0] - right[0] + 1.0) % 2.0 - 1.0)
+        return (
+            pan_distance <= tolerance
+            and abs(left[1] - right[1]) <= tolerance
+            and abs(left[2] - right[2]) <= (tolerance if zoom_tolerance is None else zoom_tolerance)
+        )
+
+    async def _read_position(self, camera_name: str):
+        try:
+            status = await asyncio.wait_for(
+                self.cams[camera_name]["ptz"].GetStatus(
+                    self.cams[camera_name]["status_request"]
+                ),
+                timeout=self.position_rpc_timeout,
+            )
+            return self._position_tuple(
+                status.Position,
+                require_zoom=self.config.cameras[camera_name].onvif.autotracking.zooming == ZoomingModeEnum.absolute,
+            )
+        except PositionStatusError:
+            raise
+        except Exception as exc:
+            raise PositionStatusError("Unable to read a fresh PTZ position") from exc
+
+    async def _position_failure(self, camera_name: str, reason: str) -> None:
+        """Stop and latch the experimental controller off until restart."""
+        first_fault = camera_name not in self.position_faults
+        self.position_faults[camera_name] = reason
+        self.config.cameras[camera_name].onvif.autotracking.enabled = False
+        metrics = self.ptz_metrics[camera_name]
+        metrics.autotracker_enabled.value = False
+        metrics.tracking_active.clear()
+        if first_fault:
+            logger.error(
+                "%s: Position-based autotracking stopped: %s. Restart after resolving the fault.",
+                camera_name,
+                reason,
+            )
+            try:
+                await asyncio.wait_for(
+                    self.cams[camera_name]["ptz"].Stop(
+                        {
+                            "ProfileToken": self.cams[camera_name]["move_request"].ProfileToken,
+                            "PanTilt": True,
+                            "Zoom": True,
+                        }
+                    ),
+                    timeout=self.position_rpc_timeout,
+                )
+            except Exception:
+                logger.exception("%s: Emergency PTZ stop failed", camera_name)
+        self.cams[camera_name]["active"] = False
+        # Wake waiters only together with the raised fault; this is not a successful move.
+        metrics.motor_stopped.set()
+        metrics.stop_time.value = metrics.frame_time.value
+
+    def _check_position_fault(self, camera_name: str) -> None:
+        if camera_name in self.position_faults:
+            raise PositionStatusError(self.position_faults[camera_name])
+
+    async def _position_move(
+        self, camera_name: str, operation, request, *, allow_no_motion=False, target=None,
+        settle_time=None, zoom_target=None, command_timeout=None, zoom_tolerance=0.0001,
+    ) -> None:
+        """Await a real, settled position before returning to calibration or tracking."""
+        self._check_position_fault(camera_name)
+        async with self.position_move_locks[camera_name]:
+            self._check_position_fault(camera_name)
+            try:
+                async with self.status_locks[camera_name]:
+                    baseline = await self._read_position(camera_name)
+                    if zoom_target is not None:
+                        target = (baseline[0], baseline[1], zoom_target)
+                    if target is not None:
+                        allow_no_motion = self._positions_match(baseline, target, zoom_tolerance=zoom_tolerance)
+                    state = self.position_states[camera_name]
+                    previous_settle_time = state.stable_time
+                    previous_command_timeout = state.command_timeout
+                    if settle_time is not None:
+                        state.stable_time = settle_time
+                    if command_timeout is not None:
+                        state.command_timeout = command_timeout
+                    # Status may also be polled by the autotracker. Validate the
+                    # endpoint before any poll can publish motor_stopped.
+                    state.command_target = target
+                    state.command_zoom_tolerance = zoom_tolerance
+                    state.begin_move(
+                        baseline, time.monotonic(), allow_no_motion=allow_no_motion,
+                        target=target, target_tolerance=(0.0001, 0.0001, zoom_tolerance),
+                    )
+                    metrics = self.ptz_metrics[camera_name]
+                    self.cams[camera_name]["active"] = True
+                    metrics.motor_stopped.clear()
+                    metrics.start_time.value = metrics.frame_time.value
+                    metrics.stop_time.value = 0
+                    await asyncio.wait_for(operation(request), self.position_rpc_timeout)
+
+                while True:
+                    await asyncio.sleep(self.position_poll_interval)
+                    pose = await self._get_position_status(camera_name)
+                    if state.state == IDLE:
+                        if target is not None and not self._positions_match(pose, target, zoom_tolerance=zoom_tolerance):
+                            raise PositionStatusError("PTZ move settled away from its target")
+                        break
+                logger.debug("%s: Position move completed at %s", camera_name, pose)
+            except asyncio.CancelledError:
+                await self._position_failure(camera_name, "Movement was interrupted")
+                raise
+            except Exception as exc:
+                await self._position_failure(camera_name, str(exc))
+                if isinstance(exc, PositionStatusError):
+                    raise
+                raise PositionStatusError("PTZ movement command failed") from exc
+            finally:
+                if "previous_settle_time" in locals():
+                    state.stable_time = previous_settle_time
+                    state.command_timeout = previous_command_timeout
+                    state.command_target = None
+
+    async def _get_position_status(self, camera_name: str):
+        self._check_position_fault(camera_name)
+        async with self.status_locks[camera_name]:
+            try:
+                pose = await self._read_position(camera_name)
+                status = self.position_states[camera_name].observe(pose, time.monotonic())
+                metrics = self.ptz_metrics[camera_name]
+                if self.config.cameras[camera_name].onvif.autotracking.zooming == ZoomingModeEnum.absolute:
+                    zoom_range = self.cams[camera_name]["absolute_zoom_range"]["XRange"]
+                    metrics.zoom_level.value = float(numpy.interp(
+                        pose[2], [zoom_range["Min"], zoom_range["Max"]], [0, 1]
+                    ))
+                if status == IDLE:
+                    target = getattr(self.position_states[camera_name], "command_target", None)
+                    if target is not None and not self._positions_match(
+                        pose, target, zoom_tolerance=self.position_states[camera_name].command_zoom_tolerance
+                    ):
+                        raise PositionStatusError("PTZ move settled away from its target")
+                    self.cams[camera_name]["active"] = False
+                    if not metrics.motor_stopped.is_set():
+                        metrics.motor_stopped.set()
+                        metrics.stop_time.value = metrics.frame_time.value
+                else:
+                    self.cams[camera_name]["active"] = True
+                    metrics.motor_stopped.clear()
+                return pose
+            except Exception as exc:
+                await self._position_failure(camera_name, str(exc))
+                if isinstance(exc, PositionStatusError):
+                    raise
+                raise PositionStatusError("Position status failed") from exc
 
     def _run_event_loop(self) -> None:
         """Run the event loop in a separate thread."""
@@ -255,6 +437,38 @@ class OnvifController:
                 logger.warning(f"Unable to get status from camera: {camera_name}: {e}")
                 status = None
 
+            if self._uses_position_status(camera_name):
+                if self.config.cameras[camera_name].onvif.autotracking.zooming == ZoomingModeEnum.relative:
+                    logger.error("%s: Position status does not support relative autotracking zoom", camera_name)
+                    return False
+                try:
+                    absolute_zoom = self.config.cameras[camera_name].onvif.autotracking.zooming == ZoomingModeEnum.absolute
+                    pose = self._position_tuple(status.Position, require_zoom=absolute_zoom)
+                    if absolute_zoom:
+                        zoom_spaces = ptz_config.Spaces.AbsoluteZoomPositionSpace or []
+                        zoom_space = next((space for space in zoom_spaces if space.URI == status.Position.Zoom.space), None)
+                        if zoom_space is None or not zoom_space.URI.endswith("/PositionGenericSpace"):
+                            raise PositionStatusError("Absolute zoom requires matching generic position feedback")
+                        if not (math.isfinite(zoom_space.XRange.Min) and math.isfinite(zoom_space.XRange.Max) and zoom_space.XRange.Min < zoom_space.XRange.Max):
+                            raise PositionStatusError("Absolute zoom requires a finite nonempty range")
+                        self.cams[camera_name]["absolute_zoom_range"] = zoom_space
+                    pan_space = status.Position.PanTilt.space
+                    if not pan_space or not pan_space.endswith("/PositionGenericSpace"):
+                        raise PositionStatusError("Position mode requires normalized generic PTZ positions")
+                    if self.config.cameras[camera_name].onvif.autotracking.preset_movement == "absolute":
+                        for attribute, uri in (
+                            ("AbsolutePanTiltPositionSpace", "http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace"),
+                            ("AbsoluteZoomPositionSpace", "http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace"),
+                        ):
+                            spaces = getattr(ptz_config.Spaces, attribute, None) or []
+                            if not any(space.URI == uri for space in spaces):
+                                raise PositionStatusError("Absolute preset recall requires generic pan/tilt and zoom spaces")
+                    self.position_states[camera_name] = PositionStatus()
+                    self.position_states[camera_name].reseed(pose, time.monotonic())
+                except (PositionStatusError, AttributeError) as exc:
+                    logger.error("%s: Position status initialization failed: %s", camera_name, exc)
+                    return False
+
             # autotracking relative panning/tilting needs a relative zoom value set to 0
             # if camera supports relative movement
             if (
@@ -265,7 +479,7 @@ class OnvifController:
                     (
                         i
                         for i, space in enumerate(
-                            ptz_config.Spaces.RelativeZoomTranslationSpace
+                            ptz_config.Spaces.RelativeZoomTranslationSpace or []
                         )
                         if "TranslationGenericSpace" in space["URI"]
                     ),
@@ -288,7 +502,11 @@ class OnvifController:
                     self.config.cameras[camera_name].onvif.autotracking.zooming
                     != ZoomingModeEnum.disabled
                 ):
-                    if zoom_space_id is not None:
+                    if self._uses_position_status(camera_name) and self.config.cameras[camera_name].onvif.autotracking.zooming == ZoomingModeEnum.absolute:
+                        # A pan/tilt request must not reuse the current absolute
+                        # zoom coordinate as a relative lens translation.
+                        move_request.Translation.Zoom = None
+                    elif zoom_space_id is not None:
                         move_request.Translation.Zoom.space = ptz_config["Spaces"][
                             "RelativeZoomTranslationSpace"
                         ][zoom_space_id]["URI"]
@@ -333,6 +551,7 @@ class OnvifController:
             logger.warning(f"Unable to get presets from camera: {camera_name}: {e}")
             presets = []
 
+        self.cams[camera_name]["preset_positions"] = {}
         for preset in presets:
             # Ensure preset name is a Unicode string and handle UTF-8 characters correctly
             preset_name = getattr(preset, "Name") or f"preset {preset['token']}"
@@ -343,6 +562,13 @@ class OnvifController:
             # Convert to lowercase while preserving UTF-8 characters
             preset_name_lower = preset_name.lower()
             self.cams[camera_name]["presets"][preset_name_lower] = preset["token"]
+            if self._uses_position_status(camera_name):
+                try:
+                    self.cams[camera_name]["preset_positions"][preset_name_lower] = (
+                        self._position_tuple(preset.PTZPosition)
+                    )
+                except (PositionStatusError, AttributeError):
+                    pass
 
         # get list of supported features
         supported_features = []
@@ -387,9 +613,10 @@ class OnvifController:
             ):
                 try:
                     # get camera's zoom limits from onvif config
-                    self.cams[camera_name]["absolute_zoom_range"] = (
-                        ptz_config.Spaces.AbsoluteZoomPositionSpace[0]
-                    )
+                    if "absolute_zoom_range" not in self.cams[camera_name]:
+                        self.cams[camera_name]["absolute_zoom_range"] = (
+                            ptz_config.Spaces.AbsoluteZoomPositionSpace[0]
+                        )
                     self.cams[camera_name]["zoom_limits"] = configs.ZoomLimits
                 except Exception as e:
                     if self.config.cameras[camera_name].onvif.autotracking.zooming:
@@ -562,22 +789,31 @@ class OnvifController:
             }
             move_request.Translation.Zoom.x = zoom
 
-        await self.cams[camera_name]["ptz"].RelativeMove(move_request)
+        try:
+            if self._uses_position_status(camera_name):
+                await self._position_move(
+                    camera_name,
+                    self.cams[camera_name]["ptz"].RelativeMove,
+                    move_request,
+                    allow_no_motion=pan == 0 and tilt == 0 and zoom == 0,
+                )
+            else:
+                await self.cams[camera_name]["ptz"].RelativeMove(move_request)
+        finally:
+            # Request objects are reused; do not leave an old translation after an error.
+            move_request.Translation.PanTilt.x = 0
+            move_request.Translation.PanTilt.y = 0
+            if (
+                "zoom-r" in self.cams[camera_name]["features"]
+                and self.config.cameras[camera_name].onvif.autotracking.zooming
+                == ZoomingModeEnum.relative
+            ):
+                move_request.Translation.Zoom.x = 0
+            self.cams[camera_name]["active"] = False
 
-        # reset after the move request
-        move_request.Translation.PanTilt.x = 0
-        move_request.Translation.PanTilt.y = 0
-
-        if (
-            "zoom-r" in self.cams[camera_name]["features"]
-            and self.config.cameras[camera_name].onvif.autotracking.zooming
-            == ZoomingModeEnum.relative
-        ):
-            move_request.Translation.Zoom.x = 0
-
-        self.cams[camera_name]["active"] = False
-
-    async def _move_to_preset(self, camera_name: str, preset: str) -> None:
+    async def _move_to_preset(
+        self, camera_name: str, preset: str, *, autotracking: bool = True
+    ) -> None:
         if isinstance(preset, bytes):
             preset = preset.decode("utf-8")
 
@@ -585,6 +821,43 @@ class OnvifController:
 
         if preset not in self.cams[camera_name]["presets"]:
             logger.error(f"{preset} is not a valid preset for {camera_name}")
+            if autotracking and self._uses_position_status(camera_name):
+                await self._position_failure(camera_name, "Unknown return preset")
+                raise PositionStatusError("Unknown return preset")
+            return
+
+        if autotracking and self._uses_position_status(camera_name):
+            target = self.cams[camera_name]["preset_positions"].get(preset)
+            auto_config = self.config.cameras[camera_name].onvif.autotracking
+            if preset == auto_config.return_preset.lower() and auto_config.return_preset_position is not None:
+                target = tuple(auto_config.return_preset_position)
+            if target is None:
+                await self._position_failure(camera_name, "Return preset has no numeric position")
+                raise PositionStatusError("Return preset has no numeric position")
+            operation = self.cams[camera_name]["ptz"].GotoPreset
+            request = {
+                "ProfileToken": self.cams[camera_name]["move_request"].ProfileToken,
+                "PresetToken": self.cams[camera_name]["presets"][preset],
+            }
+            if self.config.cameras[camera_name].onvif.autotracking.preset_movement == "absolute":
+                operation = self.cams[camera_name]["ptz"].AbsoluteMove
+                request = {
+                    "ProfileToken": request["ProfileToken"],
+                    "Position": {
+                        "PanTilt": {"x": target[0], "y": target[1], "space": "http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace"},
+                        "Zoom": {"x": target[2], "space": "http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace"},
+                    },
+                    "Speed": {"PanTilt": {"x": 1.0, "y": 1.0}, "Zoom": {"x": 1.0}},
+                }
+            await self._position_move(
+                camera_name,
+                operation,
+                request,
+                target=target,
+                # Some preset zoom encoders update less often than pan/tilt.
+                # Require a longer quiet interval for complete preset recall.
+                settle_time=1.0,
+            )
             return
 
         self.cams[camera_name]["active"] = True
@@ -629,6 +902,29 @@ class OnvifController:
             return
 
         logger.debug(f"{camera_name} called AbsoluteMove: zoom: {zoom}")
+
+        if self._uses_position_status(camera_name):
+            if not (math.isfinite(zoom) and 0 <= zoom <= 1 and math.isfinite(speed) and 0 <= speed <= 1):
+                raise PositionStatusError("Absolute zoom and speed must be finite values from 0 to 1")
+            limits = getattr(self.config.cameras[camera_name].onvif.autotracking, "position_zoom_limits", None)
+            if limits is not None:
+                zoom = float(numpy.clip(zoom, limits[0], limits[1]))
+            zoom_space = self.cams[camera_name]["absolute_zoom_range"]
+            target = float(numpy.interp(zoom, [0, 1], [zoom_space["XRange"]["Min"], zoom_space["XRange"]["Max"]]))
+            request = {
+                "ProfileToken": self.cams[camera_name]["move_request"].ProfileToken,
+                "Position": {"Zoom": {"x": target, "space": zoom_space["URI"]}},
+                "Speed": {"Zoom": {"x": speed}},
+            }
+            await self._position_move(
+                camera_name, self.cams[camera_name]["ptz"].AbsoluteMove,
+                request, zoom_target=target, settle_time=1.0, command_timeout=30.0,
+                # The camera's zoom encoder quantizes generic coordinates.
+                # Keep pan/tilt strict while allowing two ten-thousandths of
+                # the lens range at the requested zoom endpoint.
+                zoom_tolerance=0.0002,
+            )
+            return
 
         if self.cams[camera_name]["active"]:
             logger.warning(
@@ -715,7 +1011,9 @@ class OnvifController:
             elif command == OnvifCommandEnum.stop:
                 await self._stop(camera_name)
             elif command == OnvifCommandEnum.preset:
-                await self._move_to_preset(camera_name, param)
+                # Manual controls retain native preset recall and remain usable
+                # after the experimental autotracker has latched a fault.
+                await self._move_to_preset(camera_name, param, autotracking=False)
             elif command == OnvifCommandEnum.move_relative:
                 _, pan, tilt = param.split("_")
                 await self._move_relative(camera_name, float(pan), float(tilt), 0, 1)
@@ -838,6 +1136,20 @@ class OnvifController:
         if not self.cams[camera_name]["init"]:
             await self._init_onvif(camera_name)
 
+        if self._uses_position_status(camera_name):
+            self._check_position_fault(camera_name)
+            if camera_name not in self.position_states:
+                return False
+            await self._get_position_status(camera_name)
+            preset = self.config.cameras[camera_name].onvif.autotracking.return_preset.lower()
+            if preset not in self.cams[camera_name]["preset_positions"]:
+                raise PositionStatusError("Return preset has no numeric position")
+            logger.warning(
+                "%s: Using experimental position-based PTZ status; native MoveStatus is not required",
+                camera_name,
+            )
+            return True
+
         service_capabilities_request = self.cams[camera_name][
             "service_capabilities_request"
         ]
@@ -859,6 +1171,9 @@ class OnvifController:
             return False
 
     async def get_camera_status(self, camera_name: str) -> None:
+        if self._uses_position_status(camera_name):
+            await self._get_position_status(camera_name)
+            return
         async with self.status_locks[camera_name]:
             if camera_name not in self.cams.keys():
                 logger.error(f"ONVIF is not configured for {camera_name}")

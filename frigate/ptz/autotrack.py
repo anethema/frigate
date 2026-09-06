@@ -30,6 +30,7 @@ from frigate.const import (
     AUTOTRACKING_ZOOM_OUT_HYSTERESIS,
 )
 from frigate.ptz.onvif import OnvifController
+from frigate.ptz.position_status import PositionStatusError
 from frigate.track.tracked_object import TrackedObject
 from frigate.util.builtin import update_yaml_file_bulk
 from frigate.util.config import find_config_file
@@ -230,6 +231,24 @@ class PtzAutoTracker:
                 future.result()
 
     async def _autotracker_setup(self, camera_config: CameraConfig, camera: str):
+        try:
+            await self._autotracker_setup_impl(camera_config, camera)
+        except PositionStatusError as exc:
+            await self._abort_position_tracking(camera, exc)
+
+    async def _abort_position_tracking(self, camera, exc):
+        await self.onvif._position_failure(camera, str(exc))
+        self.calibrating[camera] = False
+        self.autotracker_init[camera] = False
+        self.tracked_object[camera] = None
+        if camera in self.tracked_object_history:
+            self.tracked_object_history[camera].clear()
+        if camera in self.move_queues:
+            while not self.move_queues[camera].empty():
+                self.move_queues[camera].get_nowait()
+        self.dispatcher.publish(f"{camera}/ptz_autotracker/active", "OFF", retain=False)
+
+    async def _autotracker_setup_impl(self, camera_config: CameraConfig, camera: str):
         logger.debug(f"{camera}: Autotracker init")
 
         self.object_types[camera] = camera_config.onvif.autotracking.track
@@ -295,6 +314,13 @@ class PtzAutoTracker:
                 return
 
         if self.onvif.cams[camera]["init"]:
+            # An earlier UI request may already have initialized ONVIF. Never skip
+            # experimental prerequisites just because the connection is cached.
+            if camera_config.onvif.autotracking.movement_status == "position":
+                if "pt-r-fov" not in self.onvif.cams[camera]["features"]:
+                    raise PositionStatusError("FOV-relative movement is not available")
+                if not await self.onvif.get_service_capabilities(camera):
+                    raise PositionStatusError("Position status is not initialized")
             await self.onvif.get_camera_status(camera)
 
             # movement queue with asyncio on OnvifController loop
@@ -358,6 +384,12 @@ class PtzAutoTracker:
         )
 
     async def _calibrate_camera(self, camera):
+        try:
+            await self._calibrate_camera_impl(camera)
+        finally:
+            self.calibrating[camera] = False
+
+    async def _calibrate_camera_impl(self, camera):
         # move the camera from the preset in steps and measure the time it takes to move that amount
         # this will allow us to predict movement times with a simple linear regression
         # start with 0 so we can determine a baseline (to be used as the intercept in the regression calc)
@@ -368,6 +400,8 @@ class PtzAutoTracker:
         zoom_out_values = []
 
         self.calibrating[camera] = True
+        position_mode = self.config.cameras[camera].onvif.autotracking.movement_status == "position"
+        calibration_clock = time.monotonic if position_mode else time.time
 
         logger.info(f"Camera calibration for {camera} in progress")
 
@@ -381,10 +415,11 @@ class PtzAutoTracker:
             logger.info(f"Calibration for {camera} in progress: 0% complete")
 
             for i in range(2):
-                # absolute move to 0 - fully zoomed out
+                # _zoom_absolute accepts normalized targets, independent of the
+                # camera's advertised absolute coordinate range.
                 await self.onvif._zoom_absolute(
                     camera,
-                    self.onvif.cams[camera]["absolute_zoom_range"]["XRange"]["Min"],
+                    0.0,
                     1,
                 )
 
@@ -395,7 +430,7 @@ class PtzAutoTracker:
 
                 await self.onvif._zoom_absolute(
                     camera,
-                    self.onvif.cams[camera]["absolute_zoom_range"]["XRange"]["Max"],
+                    1.0,
                     1,
                 )
 
@@ -485,7 +520,8 @@ class PtzAutoTracker:
             self.config.cameras[camera].onvif.autotracking.return_preset.lower(),
         )
         self.ptz_metrics[camera].reset.set()
-        self.ptz_metrics[camera].motor_stopped.clear()
+        if not position_mode:
+            self.ptz_metrics[camera].motor_stopped.clear()
 
         # Wait until the camera finishes moving
         while not self.ptz_metrics[camera].motor_stopped.is_set():
@@ -495,13 +531,13 @@ class PtzAutoTracker:
             pan = step_sizes[step]
             tilt = step_sizes[step]
 
-            start_time = time.time()
+            start_time = calibration_clock()
             await self.onvif._move_relative(camera, pan, tilt, 0, 1)
 
             # Wait until the camera finishes moving
             while not self.ptz_metrics[camera].motor_stopped.is_set():
                 await self.onvif.get_camera_status(camera)
-            stop_time = time.time()
+            stop_time = calibration_clock()
 
             self.move_metrics[camera].append(
                 {
@@ -517,7 +553,8 @@ class PtzAutoTracker:
                 self.config.cameras[camera].onvif.autotracking.return_preset.lower(),
             )
             self.ptz_metrics[camera].reset.set()
-            self.ptz_metrics[camera].motor_stopped.clear()
+            if not position_mode:
+                self.ptz_metrics[camera].motor_stopped.clear()
 
             # Wait until the camera finishes moving
             while not self.ptz_metrics[camera].motor_stopped.is_set():
@@ -532,7 +569,9 @@ class PtzAutoTracker:
         logger.info(f"Calibration for {camera} complete")
 
         # calculate and save new intercept and coefficients
-        self._calculate_move_coefficients(camera, True)
+        result = self._calculate_move_coefficients(camera, True)
+        if position_mode and result is not True:
+            raise PositionStatusError("Calibration did not produce valid movement coefficients")
 
     def _calculate_move_coefficients(self, camera, calibration=False):
         # calculate new coefficients when we have 50 more new values. Save up to 500
@@ -598,6 +637,7 @@ class PtzAutoTracker:
             )
 
             self._write_config(camera)
+            return True
 
     def _predict_movement_time(self, camera, pan, tilt):
         combined_movement = abs(pan) + abs(tilt)
@@ -719,13 +759,26 @@ class PtzAutoTracker:
         )
 
     async def _process_move_queue(self, camera):
+        try:
+            await self._process_move_queue_impl(camera)
+        except PositionStatusError as exc:
+            await self._abort_position_tracking(camera, exc)
+
+    async def _process_move_queue_impl(self, camera):
         move_queue = self.move_queues[camera]
+        position_mode = (
+            self.config.cameras[camera].onvif.autotracking.movement_status
+            == "position"
+        )
 
         while not self.stop_event.is_set():
             try:
                 # Asynchronously wait for move data with a timeout
                 move_data = await asyncio.wait_for(move_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
+                continue
+
+            if not self.config.cameras[camera].onvif.autotracking.enabled:
                 continue
 
             async with self.move_queue_locks[camera]:
@@ -757,7 +810,12 @@ class PtzAutoTracker:
                                 await self.onvif.get_camera_status(camera)
 
                         if (
-                            zoom > 0
+                            self.config.cameras[camera].onvif.autotracking.zooming
+                            == ZoomingModeEnum.absolute
+                            and (
+                                (position_mode and zoom is not None)
+                                or (not position_mode and zoom > 0)
+                            )
                             and self.ptz_metrics[camera].zoom_level.value != zoom
                         ):
                             await self.onvif._zoom_absolute(camera, zoom, 1)
@@ -774,32 +832,36 @@ class PtzAutoTracker:
                             f"{camera}: Actual movement time: {self.ptz_metrics[camera].stop_time.value - self.ptz_metrics[camera].start_time.value}"
                         )
 
-                    # save metrics for better estimate calculations
-                    if (
-                        self.intercept[camera] is not None
-                        and len(self.move_metrics[camera])
-                        < AUTOTRACKING_MAX_MOVE_METRICS
-                        and (pan != 0 or tilt != 0)
-                        and self.config.cameras[
-                            camera
-                        ].onvif.autotracking.calibrate_on_startup
-                    ):
-                        logger.debug(f"{camera}: Adding new values to move metrics")
-                        self.move_metrics[camera].append(
-                            {
-                                "pan": pan,
-                                "tilt": tilt,
-                                "start_timestamp": self.ptz_metrics[
-                                    camera
-                                ].start_time.value,
-                                "end_timestamp": self.ptz_metrics[
-                                    camera
-                                ].stop_time.value,
-                            }
-                        )
+                    # Position-mode startup calibration uses a monotonic clock.
+                    # PTZ metrics use frame timestamps, so they must not be mixed
+                    # into a later adaptive refit or overwrite persisted weights.
+                    if not position_mode:
+                        # save metrics for better estimate calculations
+                        if (
+                            self.intercept[camera] is not None
+                            and len(self.move_metrics[camera])
+                            < AUTOTRACKING_MAX_MOVE_METRICS
+                            and (pan != 0 or tilt != 0)
+                            and self.config.cameras[
+                                camera
+                            ].onvif.autotracking.calibrate_on_startup
+                        ):
+                            logger.debug(f"{camera}: Adding new values to move metrics")
+                            self.move_metrics[camera].append(
+                                {
+                                    "pan": pan,
+                                    "tilt": tilt,
+                                    "start_timestamp": self.ptz_metrics[
+                                        camera
+                                    ].start_time.value,
+                                    "end_timestamp": self.ptz_metrics[
+                                        camera
+                                    ].stop_time.value,
+                                }
+                            )
 
-                    # calculate new coefficients if we have enough data
-                    self._calculate_move_coefficients(camera)
+                        # calculate new coefficients if we have enough data
+                        self._calculate_move_coefficients(camera)
 
         # Clean up the queue on exit
         while not move_queue.empty():
@@ -817,6 +879,13 @@ class PtzAutoTracker:
 
             return clipped, diff
 
+        position_absolute_zoom = (
+            self.config.cameras[camera].onvif.autotracking.zooming
+            == ZoomingModeEnum.absolute
+            and self.config.cameras[camera].onvif.autotracking.movement_status
+            == "position"
+        )
+
         if (
             frame_time > self.ptz_metrics[camera].start_time.value
             and frame_time > self.ptz_metrics[camera].stop_time.value
@@ -824,10 +893,13 @@ class PtzAutoTracker:
         ):
             # we can split up any large moves caused by velocity estimated movements if necessary
             # get an excess amount and assign it instead of 0 below
-            while pan != 0 or tilt != 0 or zoom != 0:
+            while pan != 0 or tilt != 0 or (
+                zoom is not None if position_absolute_zoom else zoom != 0
+            ):
                 pan, _ = split_value(pan)
                 tilt, _ = split_value(tilt)
-                zoom, _ = split_value(zoom, False)
+                if not position_absolute_zoom:
+                    zoom, _ = split_value(zoom, False)
 
                 logger.debug(
                     f"{camera}: Enqueue movement for frame time: {frame_time} pan: {pan}, tilt: {tilt}, zoom: {zoom}"
@@ -840,7 +912,9 @@ class PtzAutoTracker:
                 # reset values to not split up large movements
                 pan = 0
                 tilt = 0
-                zoom = 0
+                # ``None`` means no absolute target.  A numeric 0.0 is a
+                # deliberate target for the fully zoomed-out endpoint.
+                zoom = None if position_absolute_zoom else 0
 
     def _touching_frame_edges(self, camera, box):
         camera_config = self.config.cameras[camera]
@@ -1217,7 +1291,14 @@ class PtzAutoTracker:
         if camera_config.onvif.autotracking.zooming != ZoomingModeEnum.disabled:
             zoom = self._get_zoom_amount(camera, obj, obj.obj_data["box"], 0)
 
-            if zoom != 0:
+            if zoom is not None and (
+                (
+                    camera_config.onvif.autotracking.zooming
+                    == ZoomingModeEnum.absolute
+                    and camera_config.onvif.autotracking.movement_status == "position"
+                )
+                or zoom != 0
+            ):
                 self._enqueue_move(camera, obj.obj_data["frame_time"], 0, 0, zoom)
 
     def _get_zoom_amount(
@@ -1234,7 +1315,17 @@ class PtzAutoTracker:
         camera_width = camera_config.frame_shape[1]
         camera_height = camera_config.frame_shape[0]
 
-        zoom = 0
+        # Position-status absolute zoom needs a distinct no-target sentinel so
+        # a valid 0.0 endpoint can be issued. Native status retains its
+        # existing numeric queue contract.
+        zoom = (
+            None
+            if (
+                camera_config.onvif.autotracking.zooming == ZoomingModeEnum.absolute
+                and camera_config.onvif.autotracking.movement_status == "position"
+            )
+            else 0
+        )
         result = None
         current_zoom_level = self.ptz_metrics[camera].zoom_level.value
         target_box = max(
@@ -1246,7 +1337,8 @@ class PtzAutoTracker:
         if camera_config.onvif.autotracking.zooming == ZoomingModeEnum.absolute:
             # don't zoom on initial move
             if "target_box" not in self.tracked_object_metrics[camera]:
-                zoom = current_zoom_level
+                if camera_config.onvif.autotracking.movement_status != "position":
+                    zoom = current_zoom_level
             else:
                 if (
                     result := self._should_zoom_in(
@@ -1450,6 +1542,12 @@ class PtzAutoTracker:
                 }
 
     async def camera_maintenance(self, camera):
+        try:
+            await self._camera_maintenance_impl(camera)
+        except PositionStatusError as exc:
+            await self._abort_position_tracking(camera, exc)
+
+    async def _camera_maintenance_impl(self, camera):
         # bail and don't check anything if we're calibrating or tracking an object
         if (
             not self.autotracker_init[camera]
