@@ -36,6 +36,7 @@ def camera_config(
     *,
     movement_status="position",
     zoom_out_hysteresis=1.1,
+    position_zoom_in_hysteresis=0.95,
     position_zoom_center_threshold=0.05,
     position_zoom_max_velocity=0.005,
 ):
@@ -52,6 +53,7 @@ def camera_config(
                 movement_weights=[],
                 return_preset="overview",
                 zoom_out_hysteresis=zoom_out_hysteresis,
+                position_zoom_in_hysteresis=position_zoom_in_hysteresis,
                 position_zoom_center_threshold=position_zoom_center_threshold,
                 position_zoom_max_velocity=position_zoom_max_velocity,
             )
@@ -114,6 +116,7 @@ def tracker_shell(
     movement_status="position",
     stop_after_move=False,
     zoom_out_hysteresis=1.1,
+    position_zoom_in_hysteresis=0.95,
     position_zoom_center_threshold=0.05,
     position_zoom_max_velocity=0.005,
 ):
@@ -123,6 +126,7 @@ def tracker_shell(
                 zooming,
                 movement_status=movement_status,
                 zoom_out_hysteresis=zoom_out_hysteresis,
+                position_zoom_in_hysteresis=position_zoom_in_hysteresis,
                 position_zoom_center_threshold=position_zoom_center_threshold,
                 position_zoom_max_velocity=position_zoom_max_velocity,
             )
@@ -144,11 +148,12 @@ def tracker_shell(
     return tracker, onvif
 
 
-def zoom_policy_tracker(*, zoom_out_hysteresis=1.1):
+def zoom_policy_tracker(*, zoom_out_hysteresis=1.1, position_zoom_in_hysteresis=0.95):
     """Build the state consumed by _should_zoom_in without an ONVIF connection."""
     tracker, _ = tracker_shell(
         ZoomingModeEnum.absolute,
         zoom_out_hysteresis=zoom_out_hysteresis,
+        position_zoom_in_hysteresis=position_zoom_in_hysteresis,
     )
     tracker.zoom_factor = {CAMERA: 0.3}
     tracker.tracked_object_metrics = {
@@ -165,6 +170,54 @@ def zoom_policy_tracker(*, zoom_out_hysteresis=1.1):
 
 
 class AbsoluteZoomAutotrackTest(unittest.IsolatedAsyncioTestCase):
+    def test_position_absolute_uses_configured_zoom_in_hysteresis(self):
+        tracker = zoom_policy_tracker(position_zoom_in_hysteresis=1.2)
+        # This target is above the stock .95 threshold but below 1.2 times
+        # the limit. Position-based absolute zoom should still move in.
+        tracker.tracked_object_metrics[CAMERA]["target_box"] = 0.22
+
+        self.assertTrue(
+            tracker._should_zoom_in(CAMERA, object(), (910, 490, 1010, 590), 0)
+        )
+
+    def test_soft_size_zoom_out_requires_centering_distance(self):
+        tracker = zoom_policy_tracker()
+        tracker.tracked_object_metrics[CAMERA]["target_box"] = 0.3
+        tracker.tracked_object_metrics[CAMERA]["below_distance_threshold"] = False
+
+        self.assertIsNone(
+            tracker._should_zoom_in(CAMERA, object(), (1300, 490, 1400, 590), 0)
+        )
+
+    def test_soft_size_zoom_out_uses_observed_box_not_prediction(self):
+        tracker = zoom_policy_tracker()
+        tracker.ptz_metrics[CAMERA].zoom_level.value = 1.0
+        tracker.tracked_object_metrics[CAMERA]["target_box"] = 0.1
+        tracker._predict_area_after_time = mock.Mock(return_value=1_000_000)
+
+        self.assertIsNone(
+            tracker._should_zoom_in(CAMERA, object(), (910, 490, 1010, 590), 1)
+        )
+
+    def test_edge_escape_still_zooms_out_when_off_center(self):
+        tracker = zoom_policy_tracker()
+        tracker.tracked_object_metrics[CAMERA]["below_distance_threshold"] = False
+
+        self.assertFalse(
+            tracker._should_zoom_in(CAMERA, object(), (0, 490, 100, 590), 0)
+        )
+
+    def test_high_velocity_escape_still_zooms_out_when_off_center(self):
+        tracker = zoom_policy_tracker()
+        tracker.tracked_object_metrics[CAMERA]["below_distance_threshold"] = False
+        tracker.tracked_object_metrics[CAMERA]["velocity"] = np.array(
+            [50.0, 0.0, 50.0, 0.0]
+        )
+
+        self.assertFalse(
+            tracker._should_zoom_in(CAMERA, object(), (1300, 490, 1400, 590), 0)
+        )
+
     def test_larger_hysteresis_suppresses_only_soft_zoom_out(self):
         default_tracker = zoom_policy_tracker(zoom_out_hysteresis=1.1)
         relaxed_tracker = zoom_policy_tracker(zoom_out_hysteresis=1.8)

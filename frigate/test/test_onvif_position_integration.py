@@ -170,15 +170,25 @@ class PositionControllerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(defaults.movement_status, "onvif")
         self.assertEqual(defaults.preset_movement, "preset")
         self.assertEqual(defaults.zoom_out_hysteresis, 1.1)
+        self.assertEqual(defaults.position_zoom_in_hysteresis, 0.95)
         self.assertEqual(defaults.position_zoom_center_threshold, 0.05)
         self.assertEqual(defaults.position_zoom_max_velocity, 0.005)
         self.assertEqual(
             PtzAutotrackConfig(zoom_out_hysteresis=1.8).zoom_out_hysteresis,
             1.8,
         )
+        self.assertEqual(
+            PtzAutotrackConfig(
+                position_zoom_in_hysteresis=1.2
+            ).position_zoom_in_hysteresis,
+            1.2,
+        )
         for hysteresis in (0.99, 3.01, float("nan")):
             with self.assertRaises(ValidationError):
                 PtzAutotrackConfig(zoom_out_hysteresis=hysteresis)
+        for hysteresis in (0.49, 1.51, float("nan")):
+            with self.assertRaises(ValidationError):
+                PtzAutotrackConfig(position_zoom_in_hysteresis=hysteresis)
         self.assertEqual(
             PtzAutotrackConfig(movement_status="position", zooming="absolute").zooming,
             "absolute",

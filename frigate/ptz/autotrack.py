@@ -1124,21 +1124,32 @@ class PtzAutoTracker:
                 camera_width * camera_height
             )
 
-        below_area_threshold = (
-            calculated_target_box
-            < self.tracked_object_metrics[camera]["max_target_box"]
+        max_target_box = self.tracked_object_metrics[camera]["max_target_box"]
+        below_area_threshold = calculated_target_box < max_target_box
+
+        # Position-based absolute moves are comparatively slow. Do not reverse
+        # zoom based on a growth prediction while the camera is also panning;
+        # the edge and velocity escape conditions below remain active.
+        zoom_out_target_box = (
+            self.tracked_object_metrics[camera]["target_box"]
+            if position_absolute_zoom
+            else calculated_target_box
         )
+        below_zoom_out_area_threshold = zoom_out_target_box < max_target_box
+        soft_zoom_out_ready = not position_absolute_zoom or below_distance_threshold
 
         # introduce some hysteresis to prevent a yo-yo zooming effect
         zoom_out_hysteresis = (
-            calculated_target_box
-            > self.tracked_object_metrics[camera]["max_target_box"]
-            * camera_config.onvif.autotracking.zoom_out_hysteresis
+            zoom_out_target_box
+            > max_target_box * camera_config.onvif.autotracking.zoom_out_hysteresis
+        )
+        zoom_in_hysteresis_value = (
+            camera_config.onvif.autotracking.position_zoom_in_hysteresis
+            if position_absolute_zoom
+            else AUTOTRACKING_ZOOM_IN_HYSTERESIS
         )
         zoom_in_hysteresis = (
-            calculated_target_box
-            < self.tracked_object_metrics[camera]["max_target_box"]
-            * AUTOTRACKING_ZOOM_IN_HYSTERESIS
+            calculated_target_box < max_target_box * zoom_in_hysteresis_value
         )
 
         at_max_zoom = (
@@ -1170,10 +1181,10 @@ class PtzAutoTracker:
             logger.debug(f"{camera}: Zoom test: at max zoom: {at_max_zoom}")
             logger.debug(f"{camera}: Zoom test: at min zoom: {at_min_zoom}")
             logger.debug(
-                f"{camera}: Zoom test: zoom in hysteresis limit: {zoom_in_hysteresis} value: {AUTOTRACKING_ZOOM_IN_HYSTERESIS} original: {self.tracked_object_metrics[camera]['original_target_box']} max: {self.tracked_object_metrics[camera]['max_target_box']} target: {calculated_target_box if calculated_target_box else self.tracked_object_metrics[camera]['target_box']}"
+                f"{camera}: Zoom test: zoom in hysteresis limit: {zoom_in_hysteresis} value: {zoom_in_hysteresis_value} original: {self.tracked_object_metrics[camera]['original_target_box']} max: {self.tracked_object_metrics[camera]['max_target_box']} target: {calculated_target_box if calculated_target_box else self.tracked_object_metrics[camera]['target_box']}"
             )
             logger.debug(
-                f"{camera}: Zoom test: zoom out hysteresis limit: {zoom_out_hysteresis} value: {camera_config.onvif.autotracking.zoom_out_hysteresis} original: {self.tracked_object_metrics[camera]['original_target_box']} max: {self.tracked_object_metrics[camera]['max_target_box']} target: {calculated_target_box if calculated_target_box else self.tracked_object_metrics[camera]['target_box']}"
+                f"{camera}: Zoom test: zoom out hysteresis limit: {zoom_out_hysteresis} value: {camera_config.onvif.autotracking.zoom_out_hysteresis} ready: {soft_zoom_out_ready} original: {self.tracked_object_metrics[camera]['original_target_box']} max: {self.tracked_object_metrics[camera]['max_target_box']} target: {zoom_out_target_box}"
             )
             if position_absolute_zoom:
                 logger.debug(
@@ -1186,7 +1197,6 @@ class PtzAutoTracker:
             and touching_frame_edges == 0
             and below_velocity_threshold
             and below_dimension_threshold
-            and below_area_threshold
             and position_zoom_safe
             and not at_max_zoom
         ):
@@ -1196,10 +1206,16 @@ class PtzAutoTracker:
         if (
             (
                 zoom_out_hysteresis
+                and soft_zoom_out_ready
                 and not at_max_zoom
-                and (not below_area_threshold or not below_dimension_threshold)
+                and (not below_zoom_out_area_threshold or not below_dimension_threshold)
             )
-            or (zoom_out_hysteresis and not below_area_threshold and at_max_zoom)
+            or (
+                zoom_out_hysteresis
+                and soft_zoom_out_ready
+                and not below_zoom_out_area_threshold
+                and at_max_zoom
+            )
             or (
                 touching_frame_edges == 1
                 and (below_distance_threshold or not below_dimension_threshold)

@@ -57,6 +57,12 @@ class PtzAutotrackConfig(FrigateBaseModel):
         ge=1.0,
         le=3.0,
     )
+    position_zoom_in_hysteresis: float = Field(
+        default=0.95,
+        title="Object-size multiplier that permits position-based absolute zoom-in.",
+        ge=0.5,
+        le=1.5,
+    )
     position_zoom_center_threshold: float = Field(
         default=0.05,
         title="Maximum normalized distance from each frame axis before position-based zooming.",
