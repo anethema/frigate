@@ -1482,6 +1482,37 @@ class PtzAutoTracker:
                 logger.debug(f"{camera}: Calibrating camera")
                 return
 
+            # Once the tracked object becomes stationary, release it so camera
+            # maintenance can return to the configured preset after the timeout.
+            # Without this, a parked vehicle remains the autotracked target for
+            # as long as the object tracker keeps the event alive.
+            if (
+                self.tracked_object[camera] is not None
+                and obj.obj_data["id"] == self.tracked_object[camera].obj_data["id"]
+                and not obj.active
+            ):
+                logger.info(
+                    f"{camera}: Tracked {obj.obj_data['label']} "
+                    f"{obj.obj_data['id']} became stationary; ending autotracking"
+                )
+                # Anchor the return timeout and any later reacquisition check to
+                # the frame that made the target stationary, rather than to an
+                # older movement frame.
+                if (
+                    not self.tracked_object_history[camera]
+                    or obj.obj_data["frame_time"]
+                    != self.tracked_object_history[camera][-1]["frame_time"]
+                ):
+                    self.tracked_object_history[camera].append(
+                        copy.deepcopy(obj.obj_data)
+                    )
+                self.tracked_object[camera] = None
+                self.tracked_object_metrics[camera] = {
+                    "max_target_box": AUTOTRACKING_MAX_AREA_RATIO
+                    ** (1 / self.zoom_factor[camera])
+                }
+                return
+
             # this is a brand new object that's on our camera, has our label, entered the zone,
             # is not a false positive, and is active
             if (
@@ -1553,6 +1584,7 @@ class PtzAutoTracker:
                 == self.tracked_object_history[camera][-1]["label"]
                 and not obj.previous["false_positive"]
                 and not obj.false_positive
+                and obj.active
             ):
                 if (
                     intersection_over_union(
