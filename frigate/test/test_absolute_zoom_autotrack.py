@@ -12,6 +12,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
+
 import frigate.ptz.autotrack as autotrack_module
 from frigate.config import ZoomingModeEnum
 from frigate.ptz.autotrack import PtzAutoTracker
@@ -29,7 +31,14 @@ class ImmediateLoop:
         callback(*args)
 
 
-def camera_config(zooming, *, movement_status="position"):
+def camera_config(
+    zooming,
+    *,
+    movement_status="position",
+    zoom_out_hysteresis=1.1,
+    position_zoom_center_threshold=0.05,
+    position_zoom_max_velocity=0.005,
+):
     return SimpleNamespace(
         name=CAMERA,
         detect=SimpleNamespace(fps=5),
@@ -42,6 +51,9 @@ def camera_config(zooming, *, movement_status="position"):
                 calibrate_on_startup=False,
                 movement_weights=[],
                 return_preset="overview",
+                zoom_out_hysteresis=zoom_out_hysteresis,
+                position_zoom_center_threshold=position_zoom_center_threshold,
+                position_zoom_max_velocity=position_zoom_max_velocity,
             )
         ),
     )
@@ -96,9 +108,25 @@ class FakeOnvif:
         return None
 
 
-def tracker_shell(zooming, *, movement_status="position", stop_after_move=False):
+def tracker_shell(
+    zooming,
+    *,
+    movement_status="position",
+    stop_after_move=False,
+    zoom_out_hysteresis=1.1,
+    position_zoom_center_threshold=0.05,
+    position_zoom_max_velocity=0.005,
+):
     config = SimpleNamespace(
-        cameras={CAMERA: camera_config(zooming, movement_status=movement_status)}
+        cameras={
+            CAMERA: camera_config(
+                zooming,
+                movement_status=movement_status,
+                zoom_out_hysteresis=zoom_out_hysteresis,
+                position_zoom_center_threshold=position_zoom_center_threshold,
+                position_zoom_max_velocity=position_zoom_max_velocity,
+            )
+        }
     )
     tracker = PtzAutoTracker.__new__(PtzAutoTracker)
     tracker.config = config
@@ -116,7 +144,77 @@ def tracker_shell(zooming, *, movement_status="position", stop_after_move=False)
     return tracker, onvif
 
 
+def zoom_policy_tracker(*, zoom_out_hysteresis=1.1):
+    """Build the state consumed by _should_zoom_in without an ONVIF connection."""
+    tracker, _ = tracker_shell(
+        ZoomingModeEnum.absolute,
+        zoom_out_hysteresis=zoom_out_hysteresis,
+    )
+    tracker.zoom_factor = {CAMERA: 0.3}
+    tracker.tracked_object_metrics = {
+        CAMERA: {
+            "velocity": np.zeros(4),
+            "valid_velocity": True,
+            "below_distance_threshold": True,
+            "target_box": 0.1,
+            "original_target_box": 0.1,
+            "max_target_box": 0.2,
+        }
+    }
+    return tracker
+
+
 class AbsoluteZoomAutotrackTest(unittest.IsolatedAsyncioTestCase):
+    def test_larger_hysteresis_suppresses_only_soft_zoom_out(self):
+        default_tracker = zoom_policy_tracker(zoom_out_hysteresis=1.1)
+        relaxed_tracker = zoom_policy_tracker(zoom_out_hysteresis=1.8)
+        for tracker in (default_tracker, relaxed_tracker):
+            tracker.tracked_object_metrics[CAMERA]["target_box"] = 0.3
+
+        centered_box = (910, 490, 1010, 590)
+        self.assertFalse(
+            default_tracker._should_zoom_in(CAMERA, object(), centered_box, 0)
+        )
+        self.assertIsNone(
+            relaxed_tracker._should_zoom_in(CAMERA, object(), centered_box, 0)
+        )
+
+    def test_edge_escape_bypasses_relaxed_hysteresis(self):
+        tracker = zoom_policy_tracker(zoom_out_hysteresis=1.8)
+        tracker.tracked_object_metrics[CAMERA]["target_box"] = 0.1
+
+        self.assertFalse(
+            tracker._should_zoom_in(CAMERA, object(), (0, 490, 100, 590), 0)
+        )
+
+    def test_position_zoom_in_requires_tight_centering(self):
+        tracker = zoom_policy_tracker()
+
+        # The broad no-pan threshold can still say True, but an object 5.2%
+        # of frame width from center must not start a serialized lens move.
+        self.assertIsNone(
+            tracker._should_zoom_in(CAMERA, object(), (1010, 490, 1110, 590), 0)
+        )
+
+    def test_position_zoom_in_requires_low_normalized_velocity(self):
+        tracker = zoom_policy_tracker()
+        # 10px/frame is above .005 of a 1920px frame, while remaining below
+        # the legacy broad .02/frame velocity threshold.
+        tracker.tracked_object_metrics[CAMERA]["velocity"] = np.array(
+            [10.0, 0.0, 10.0, 0.0]
+        )
+
+        self.assertIsNone(
+            tracker._should_zoom_in(CAMERA, object(), (910, 490, 1010, 590), 0)
+        )
+
+    def test_position_zoom_in_allows_centered_still_object(self):
+        tracker = zoom_policy_tracker()
+
+        self.assertTrue(
+            tracker._should_zoom_in(CAMERA, object(), (910, 490, 1010, 590), 0)
+        )
+
     async def test_absolute_zero_target_is_enqueued_and_dispatched(self):
         tracker, onvif = tracker_shell(ZoomingModeEnum.absolute, stop_after_move=True)
 

@@ -27,7 +27,6 @@ from frigate.const import (
     AUTOTRACKING_MOTION_MIN_DISTANCE,
     AUTOTRACKING_ZOOM_EDGE_THRESHOLD,
     AUTOTRACKING_ZOOM_IN_HYSTERESIS,
-    AUTOTRACKING_ZOOM_OUT_HYSTERESIS,
 )
 from frigate.ptz.onvif import OnvifController
 from frigate.ptz.position_status import PositionStatusError
@@ -1089,6 +1088,33 @@ class PtzAutoTracker:
             < np.tile([velocity_threshold_x, velocity_threshold_y], 2)
         ) or np.all(average_velocity == 0)
 
+        position_absolute_zoom = (
+            camera_config.onvif.autotracking.movement_status == "position"
+            and camera_config.onvif.autotracking.zooming == ZoomingModeEnum.absolute
+        )
+        position_zoom_safe = True
+        if position_absolute_zoom:
+            center_threshold = (
+                camera_config.onvif.autotracking.position_zoom_center_threshold
+            )
+            centroid_x = (bb_left + bb_right) / 2
+            centroid_y = (bb_top + bb_bottom) / 2
+            centered = (
+                abs(centroid_x - camera_width / 2) <= camera_width * center_threshold
+                and abs(centroid_y - camera_height / 2)
+                <= camera_height * center_threshold
+            )
+            normalized_velocity = np.abs(average_velocity) / np.tile(
+                [camera_width, camera_height], 2
+            )
+            velocity_safe = self.tracked_object_metrics[camera][
+                "valid_velocity"
+            ] and np.all(
+                normalized_velocity
+                < camera_config.onvif.autotracking.position_zoom_max_velocity
+            )
+            position_zoom_safe = below_distance_threshold and centered and velocity_safe
+
         if not predicted_time:
             calculated_target_box = self.tracked_object_metrics[camera]["target_box"]
         else:
@@ -1107,7 +1133,7 @@ class PtzAutoTracker:
         zoom_out_hysteresis = (
             calculated_target_box
             > self.tracked_object_metrics[camera]["max_target_box"]
-            * AUTOTRACKING_ZOOM_OUT_HYSTERESIS
+            * camera_config.onvif.autotracking.zoom_out_hysteresis
         )
         zoom_in_hysteresis = (
             calculated_target_box
@@ -1147,8 +1173,12 @@ class PtzAutoTracker:
                 f"{camera}: Zoom test: zoom in hysteresis limit: {zoom_in_hysteresis} value: {AUTOTRACKING_ZOOM_IN_HYSTERESIS} original: {self.tracked_object_metrics[camera]['original_target_box']} max: {self.tracked_object_metrics[camera]['max_target_box']} target: {calculated_target_box if calculated_target_box else self.tracked_object_metrics[camera]['target_box']}"
             )
             logger.debug(
-                f"{camera}: Zoom test: zoom out hysteresis limit: {zoom_out_hysteresis} value: {AUTOTRACKING_ZOOM_OUT_HYSTERESIS} original: {self.tracked_object_metrics[camera]['original_target_box']} max: {self.tracked_object_metrics[camera]['max_target_box']} target: {calculated_target_box if calculated_target_box else self.tracked_object_metrics[camera]['target_box']}"
+                f"{camera}: Zoom test: zoom out hysteresis limit: {zoom_out_hysteresis} value: {camera_config.onvif.autotracking.zoom_out_hysteresis} original: {self.tracked_object_metrics[camera]['original_target_box']} max: {self.tracked_object_metrics[camera]['max_target_box']} target: {calculated_target_box if calculated_target_box else self.tracked_object_metrics[camera]['target_box']}"
             )
+            if position_absolute_zoom:
+                logger.debug(
+                    f"{camera}: Zoom test: position zoom safe: {position_zoom_safe} normalized velocity: {tuple(normalized_velocity)}"
+                )
 
         # Zoom in conditions (and)
         if (
@@ -1157,6 +1187,7 @@ class PtzAutoTracker:
             and below_velocity_threshold
             and below_dimension_threshold
             and below_area_threshold
+            and position_zoom_safe
             and not at_max_zoom
         ):
             return True

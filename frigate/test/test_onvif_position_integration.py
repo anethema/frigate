@@ -14,6 +14,8 @@ from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
+from pydantic import ValidationError
+
 import frigate.ptz.autotrack as autotrack_module
 from frigate.config.camera.onvif import PtzAutotrackConfig
 from frigate.ptz.autotrack import PtzAutoTracker
@@ -167,6 +169,16 @@ class PositionControllerTest(unittest.IsolatedAsyncioTestCase):
         defaults = PtzAutotrackConfig()
         self.assertEqual(defaults.movement_status, "onvif")
         self.assertEqual(defaults.preset_movement, "preset")
+        self.assertEqual(defaults.zoom_out_hysteresis, 1.1)
+        self.assertEqual(defaults.position_zoom_center_threshold, 0.05)
+        self.assertEqual(defaults.position_zoom_max_velocity, 0.005)
+        self.assertEqual(
+            PtzAutotrackConfig(zoom_out_hysteresis=1.8).zoom_out_hysteresis,
+            1.8,
+        )
+        for hysteresis in (0.99, 3.01, float("nan")):
+            with self.assertRaises(ValidationError):
+                PtzAutotrackConfig(zoom_out_hysteresis=hysteresis)
         self.assertEqual(
             PtzAutotrackConfig(movement_status="position", zooming="absolute").zooming,
             "absolute",

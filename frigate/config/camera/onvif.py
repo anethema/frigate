@@ -51,6 +51,24 @@ class PtzAutotrackConfig(FrigateBaseModel):
         ge=0.1,
         le=0.75,
     )
+    zoom_out_hysteresis: float = Field(
+        default=1.1,
+        title="Object-size multiplier required before reversing an autotracking zoom.",
+        ge=1.0,
+        le=3.0,
+    )
+    position_zoom_center_threshold: float = Field(
+        default=0.05,
+        title="Maximum normalized distance from each frame axis before position-based zooming.",
+        ge=0.01,
+        le=0.25,
+    )
+    position_zoom_max_velocity: float = Field(
+        default=0.005,
+        title="Maximum normalized per-frame object velocity for position-based zooming.",
+        gt=0,
+        le=0.1,
+    )
     track: list[str] = Field(default=DEFAULT_TRACKED_OBJECTS, title="Objects to track.")
     required_zones: list[str] = Field(
         default_factory=list,
