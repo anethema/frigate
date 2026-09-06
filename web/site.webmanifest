@@ -1,6 +1,7 @@
 {
   "name": "Frigate",
   "short_name": "Frigate",
+  "description": "Frigate Network Video Recorder",
   "start_url": "/BASE_PATH/",
   "icons": [
     {
