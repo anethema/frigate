@@ -1501,9 +1501,11 @@ class PtzAutoTracker:
                 self.tracked_object[camera] is None
                 and obj.camera_config.name == camera
                 and obj.obj_data["label"] in self.object_types[camera]
+                and self.tracked_object_history[camera]
+                and obj.obj_data["label"]
+                == self.tracked_object_history[camera][-1]["label"]
                 and not obj.previous["false_positive"]
                 and not obj.false_positive
-                and self.tracked_object_history[camera]
             ):
                 if (
                     intersection_over_union(
